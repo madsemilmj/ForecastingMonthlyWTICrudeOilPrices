@@ -1,0 +1,878 @@
+---
+title: "Predicting WTI crude oil prices"
+subtitle: 'Empirical Project - Causal Inference'
+author: "Mads Emil Marker Jungersen & Jeppe Dalgaard Rode"
+date: "01/09-2020"
+header-includes:
+   - \usepackage{amsmath}
+   - \usepackage{ textcomp }
+   - \usepackage{graphicx}
+output:
+  pdf_document: default
+  html_document: default
+  word_document: default
+documentclass: article
+classoption: a4paper
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+library(cowplot)
+library(wooldridge)
+library(mfx)
+library(AER)
+library(car)
+library(plm)
+library(foreign)
+library(rddtools)
+library(Matching)
+library(rgenoud)
+library(readxl)
+library(tseries)
+library(forecast)
+library(RSNNS)
+library(glmnet)
+```
+
+## Importing and fixing data
+
+```{r}
+rm(list=ls())
+data <- read_excel("Data/Monthly_WTI.xlsx")
+
+##Adding oil supply
+supply <- read.csv("Data/Crude_oil_including_lease_condensate_production_World_Monthly.csv", skip = 4, header = T)
+supply$Date <- parse_date(paste(substr(supply$Month, 1, 3), '15',substr(supply$Month, 5, 8)),format = "%b %d %Y", locale=locale("en"))
+supply <- subset(supply, select = c(Date,Series.ID..INTL.57.1.WORL.TBPD.M.thousand.barrels.per.day))
+colnames(supply) <- c("Date", "Supply")
+data <- inner_join(data, supply, by="Date")
+
+##Adding kilian index (oil demand)
+kilian <- read_excel("Data/kilian.xlsx")
+kilian$Date2 <- as.Date(kilian$Date) + 14
+kilian <- subset(kilian, select = c(Date2, index))
+colnames(kilian) <- c("Date", "KI")
+data <- inner_join(data, kilian, by="Date")
+
+
+##Adding SP500 closing price
+SP500 <- read.csv("Data/SP500_closing.csv", header = T)
+SP500 <- subset(SP500, select=c(Date, Adj.Close))
+SP500$Date2 <- as.Date(as.Date(SP500$Date) + 14)
+SP500 <- subset(SP500, select=c(Date2, Adj.Close))
+colnames(SP500) <- c("Date", "SP500")
+data <- inner_join(data, SP500, by="Date")
+
+#Adding t for trend
+data$t <-  seq.int(nrow(data))
+data$tsq <- data$t^2
+data$tcu <- data$t^3
+
+# Adding a one day lag of oil price
+data$Price_1 <- c(NA,data$Price[-length(data$Price)])
+
+#####Adding Geopolitical Events
+#Iraq invades kuwait (one in aug-sep 1990)
+data$IIK <- ifelse(data$Date >= as.Date("1990-08-01") & data$Date < as.Date("1990-10-01"),1,0)
+#Asian financial crisis (one in july 1997-dec 1998)
+data$AFC <- ifelse(data$Date >= as.Date("1997-07-01") & data$Date < as.Date("1999-01-01"),1,0)
+#9/11 attacks (one in sep-nov 2001)
+data$NE <- ifelse(data$Date >= as.Date("2001-09-01") & data$Date < as.Date("2001-12-01"),1,0)
+#Global financial collapse (One in sep 2008 to feb 2009)
+data$GFC <- ifelse(data$Date >= as.Date("2008-09-01") & data$Date < as.Date("2009-03-01"),1,0)
+#Global pandamic crisis (One in 2020)
+data$GPC <- ifelse(data$Date >= as.Date("2020-01-01"),1,0)
+
+
+#####Adding Dummy-variables for month
+data$feb <- ifelse(grepl("-02",data$Date),1,0)
+data$mar <- ifelse(grepl("-03",data$Date),1,0)
+data$apr <- ifelse(grepl("-04",data$Date),1,0)
+data$may <- ifelse(grepl("-05",data$Date),1,0)
+data$jun <- ifelse(grepl("-06",data$Date),1,0)
+data$jul <- ifelse(grepl("-07",data$Date),1,0)
+data$aug <- ifelse(grepl("-08",data$Date),1,0)
+data$sep <- ifelse(grepl("-09",data$Date),1,0)
+data$oct <- ifelse(grepl("-10",data$Date),1,0)
+data$nov <- ifelse(grepl("-11",data$Date),1,0)
+data$dec <- ifelse(grepl("-12",data$Date),1,0)
+
+########PLOT THE MONTHLY DATA
+#jpeg(file="monthly.jpeg")
+plot(ts(data$Price,start = c(1986,1), frequency = 12), ylab="WTI Crude Oil Price", main = "Monthly WTI crude oil spot price")
+#dev.off()
+
+```
+
+## Augmented Dickey Fuller test for unit-root auto $k$
+
+```{r}
+lag_orders <- numeric(4)
+test_statistics <- numeric(4)
+p_vals <- numeric(4)
+for (i in 2:5){
+  lag_orders[i-1] <- adf.test(ts(data[i]))$parameter
+  test_statistics[i-1] <- adf.test(ts(data[i]))$statistic
+  p_vals[i-1] <- adf.test(ts(data[i]))$p.value
+}
+
+Table <- cbind(lag_orders,test_statistics,p_vals)
+rownames(Table)<- c("Price", "Supply", "KI", "SP500")
+colnames(Table) <- c("# Lags", "Test Statistic", "P-value")
+Table %>%
+  kable(digits = 3, "latex", booktabs = T)%>%
+  kable_styling()%>%
+  add_header_above(c("Augmented Dickey Fuller test"=4))
+
+```
+## Augmented Dickey Fuller test for unit-root auto $k=0$
+
+```{r}
+lag_orders <- numeric(4)
+test_statistics <- numeric(4)
+p_vals <- numeric(4)
+for (i in 2:5){
+  lag_orders[i-1] <- adf.test(ts(data[i]),k=0)$parameter
+  test_statistics[i-1] <- adf.test(ts(data[i]),k=0)$statistic
+  p_vals[i-1] <- adf.test(ts(data[i]),k=0)$p.value
+}
+
+Table <- cbind(lag_orders,test_statistics,p_vals)
+rownames(Table)<- c("Price", "Supply", "KI", "SP500")
+colnames(Table) <- c("# Lags", "Test Statistic", "P-value")
+Table %>%
+  kable(digits = 3, "latex", booktabs = T)%>%
+  kable_styling()%>%
+  add_header_above(c("Augmented Dickey Fuller test"=4))
+
+```
+
+
+## First difference data that have unit root
+
+```{r}
+data$D_Price <- c(NA,diff(data$Price))
+data$D_Supply <- c(NA,diff(data$Supply))
+data$D_KI <- c(NA,diff(data$KI))
+data$D_SP500 <- c(NA,diff(data$SP500))
+```
+
+
+## Lagging variables once
+
+```{r}
+data$Price_1 <-  c(NA,data$Price[-length(data$Price)])
+data$Supply_1 <-  c(NA,data$Supply[-length(data$Supply)])
+data$KI_1 <-  c(NA,data$KI[-length(data$KI)])
+data$SP500_1 <-  c(NA,data$SP500[-length(data$SP500)])
+data$D_Price_1 <-  c(NA,data$D_Price[-length(data$D_Price)])
+data$D_Supply_1 <-  c(NA,data$D_Supply[-length(data$D_Supply)])
+data$D_KI_1 <-  c(NA,data$D_KI[-length(data$D_KI)])
+data$D_SP500_1 <-  c(NA,data$D_SP500[-length(data$D_SP500)])
+```
+## Lagging variables twice
+
+```{r}
+data$Price_2 <-  c(NA,data$Price_1[-length(data$Price_1)])
+data$D_Price_2 <-  c(NA,data$D_Price_1[-length(data$D_Price_1)])
+data$D_Supply_2 <-  c(NA,data$D_Supply_1[-length(data$D_Supply_1)])
+data$D_KI_2 <-  c(NA,data$D_KI_1[-length(data$D_KI_1)])
+data$D_SP500_2 <-  c(NA,data$D_SP500_1[-length(data$D_SP500_1)])
+```
+
+## Adding more lags 
+```{r}
+##PRICE
+data$D_Price_3 <-  c(NA,data$D_Price_2[-length(data$D_Price_2)])
+data$D_Price_4 <-  c(NA,data$D_Price_3[-length(data$D_Price_3)])
+data$D_Price_5 <-  c(NA,data$D_Price_4[-length(data$D_Price_4)])
+data$D_Price_6 <-  c(NA,data$D_Price_5[-length(data$D_Price_5)])
+
+##SUPPLY
+data$D_Supply_3 <-  c(NA,data$D_Supply_2[-length(data$D_Supply_2)])
+data$D_Supply_4 <-  c(NA,data$D_Supply_3[-length(data$D_Supply_3)])
+data$D_Supply_5 <-  c(NA,data$D_Supply_4[-length(data$D_Supply_4)])
+data$D_Supply_6 <-  c(NA,data$D_Supply_5[-length(data$D_Supply_5)])
+
+## KI
+data$D_KI_3 <-  c(NA,data$D_KI_2[-length(data$D_KI_2)])
+data$D_KI_4 <-  c(NA,data$D_KI_3[-length(data$D_KI_3)])
+data$D_KI_5 <-  c(NA,data$D_KI_4[-length(data$D_KI_4)])
+data$D_KI_6 <-  c(NA,data$D_KI_5[-length(data$D_KI_5)])
+
+## SP500
+data$D_SP500_3 <-  c(NA,data$D_SP500_2[-length(data$D_SP500_2)])
+data$D_SP500_4 <-  c(NA,data$D_SP500_3[-length(data$D_SP500_3)])
+data$D_SP500_5 <-  c(NA,data$D_SP500_4[-length(data$D_SP500_4)])
+data$D_SP500_6 <-  c(NA,data$D_SP500_5[-length(data$D_SP500_5)])
+
+```
+
+
+
+## Exporting data
+
+```{r}
+save(data, file = "data.RData")
+```
+
+
+
+## Forcasting models
+
+Making out-of-sample where the data from January 1986 uptil and including December 2013 are used as training the model, and the data from January 2014 up til and including August 2020 are used for testing the model. This roughly corresponds to a $80/20\%$ split of the data. 
+
+```{r}
+train <- subset(data, Date < as.Date("2014-01-01"))
+test <- subset(data, Date >= as.Date("2014-01-01"))
+```
+
+First want to determine the number of lags we should use of the dependent variable
+
+```{r}
+LM <- lm(D_Price ~ D_Price_1 + D_Price_2 + D_Price_3 + D_Price_4 + D_Price_5 + D_Price_6 + IIK + AFC + NE + GFC, data=subset(train,t>7))
+summary(LM)
+LM1 <- lm(D_Price ~ D_Price_1 + IIK + AFC + NE + GFC, data=subset(train,t>7))
+anova(LM1,LM)
+```
+
+We will be using $6$ lags, and compare it with the $AR(1)$ model.
+
+### (i) Testing for the explanatory variables when using 6 lags.
+
+#### Does supply granger cause price?
+
+```{r}
+LMUD <- lm(D_Price ~ D_Price_1 + D_Price_2 + D_Price_3 + D_Price_4 + D_Price_5 + D_Price_6 + D_Supply_1 +D_Supply_2 + D_Supply_3 + D_Supply_4 + D_Supply_5 + D_Supply_6, data=subset(train,t>7))
+summary(LMUD)
+LMtil <- lm(D_Price ~ D_Price_1 + D_Price_2 + D_Price_3 + D_Price_4 + D_Price_5 + D_Price_6, data=subset(train,t>7))
+anova(LMtil,LMUD)
+```
+Dosent seem like it.
+
+#### Does KI granger cause price?
+
+```{r}
+LMUD <- lm(D_Price ~ D_Price_1 + D_Price_2 + D_Price_3 + D_Price_4 + D_Price_5 + D_Price_6 + D_KI_1 + D_KI_2 + D_KI_3 + D_KI_4 + D_KI_5 + D_KI_6, data=subset(train,t>7))
+summary(LMUD)
+LMtil <- lm(D_Price ~ D_Price_1 + D_Price_2 + D_Price_3 + D_Price_4 + D_Price_5 + D_Price_6, data=subset(train,t>7))
+anova(LMtil,LMUD)
+```
+Dosent seem like it - however close to being significant.
+
+#### Does SP500 granger cause price?
+
+```{r}
+LMUD <- lm(D_Price ~ D_Price_1 + D_Price_2 + D_Price_3 + D_Price_4 + D_Price_5 + D_Price_6 + D_SP500_1 + D_SP500_2 + D_SP500_3 + D_SP500_4 + D_SP500_5 + D_SP500_6, data=subset(train,t>7))
+summary(LMUD)
+LMtil <- lm(D_Price ~ D_Price_1 + D_Price_2 + D_Price_3 + D_Price_4 + D_Price_5 + D_Price_6, data=subset(train,t>7))
+anova(LMtil,LMUD)
+```
+YES!
+
+```{r}
+#HOW MANY LAGS?
+#1?
+LMUD <- lm(D_Price ~ D_Price_1 + D_Price_2 + D_Price_3 + D_Price_4 + D_Price_5 + D_Price_6 + D_SP500_1 + D_SP500_2 + D_SP500_3 + D_SP500_4 + D_SP500_5 + D_SP500_6, data=subset(train,t>7))
+#summary(LMUD)
+LMtil <- lm(D_Price ~ D_Price_1 + D_Price_2 + D_Price_3 + D_Price_4 + D_Price_5 + D_Price_6+ D_SP500_1, data=subset(train,t>7))
+anova(LMtil,LMUD)
+# One is enough
+```
+
+#### Does Supply granger cause the price when conditioning on SP500?
+
+```{r}
+LMUD <- lm(D_Price ~ D_Price_1 + D_Price_2 + D_Price_3 + D_Price_4 + D_Price_5 + D_Price_6 + D_SP500_1 + D_Supply_1 + D_Supply_2 + D_Supply_3 + D_Supply_4 + D_Supply_5 + D_Supply_6, data=subset(train,t>7))
+summary(LMUD)
+LMtil <- lm(D_Price ~ D_Price_1 + D_Price_2 + D_Price_3 + D_Price_4 + D_Price_5 + D_Price_6 + D_SP500_1, data=subset(train,t>7))
+anova(LMtil,LMUD)
+```
+No.
+
+
+#### Does KI granger cause the price when conditioning on SP500?
+
+```{r}
+LMUD <- lm(D_Price ~ D_Price_1 + D_Price_2 + D_Price_3 + D_Price_4 + D_Price_5 + D_Price_6 + D_SP500_1 + D_KI_1 + D_KI_2 + D_KI_3 + D_KI_4 + D_KI_5 + D_KI_6, data=subset(train,t>7))
+summary(LMUD)
+LMtil <- lm(D_Price ~ D_Price_1 + D_Price_2 + D_Price_3 + D_Price_4 + D_Price_5 + D_Price_6 + D_SP500_1, data=subset(train,t>7))
+anova(LMtil,LMUD)
+```
+No.
+
+
+
+
+
+
+### (ii) Testing for the explanatory variables when using 6 lags and dummies.
+
+#### Does supply granger cause price?
+
+```{r}
+LMUD <- lm(D_Price ~ D_Price_1 + D_Price_2 + D_Price_3 + D_Price_4 + D_Price_5 + D_Price_6 + D_Supply_1 +D_Supply_2 + D_Supply_3 + D_Supply_4 + D_Supply_5 + D_Supply_6+ IIK + AFC + NE + GFC, data=subset(train,t>7))
+summary(LMUD)
+LMtil <- lm(D_Price ~ D_Price_1 + D_Price_2 + D_Price_3 + D_Price_4 + D_Price_5 + D_Price_6+ IIK + AFC + NE + GFC, data=subset(train,t>7))
+anova(LMtil,LMUD)
+```
+Dosent seem like it.
+
+#### Does KI granger cause price?
+
+```{r}
+LMUD <- lm(D_Price ~ D_Price_1 + D_Price_2 + D_Price_3 + D_Price_4 + D_Price_5 + D_Price_6 + D_KI_1 + D_KI_2 + D_KI_3 + D_KI_4 + D_KI_5 + D_KI_6+ IIK + AFC + NE + GFC, data=subset(train,t>7))
+summary(LMUD)
+LMtil <- lm(D_Price ~ D_Price_1 + D_Price_2 + D_Price_3 + D_Price_4 + D_Price_5 + D_Price_6+ IIK + AFC + NE + GFC, data=subset(train,t>7))
+anova(LMtil,LMUD)
+```
+Dosent seem like it - however close to being significant.
+
+#### Does SP500 granger cause price?
+
+```{r}
+LMUD <- lm(D_Price ~ D_Price_1 + D_Price_2 + D_Price_3 + D_Price_4 + D_Price_5 + D_Price_6 + D_SP500_1 + D_SP500_2 + D_SP500_3 + D_SP500_4 + D_SP500_5 + D_SP500_6 + IIK + AFC + NE + GFC, data=subset(train,t>7))
+summary(LMUD)
+LMtil <- lm(D_Price ~ D_Price_1 + D_Price_2 + D_Price_3 + D_Price_4 + D_Price_5 + D_Price_6+ IIK + AFC + NE + GFC, data=subset(train,t>7))
+anova(LMtil,LMUD)
+```
+SP500_t-1 does.
+
+```{r}
+#HOW MANY LAGS?
+#1?
+LMUD <- lm(D_Price ~ D_Price_1 + D_Price_2 + D_Price_3 + D_Price_4 + D_Price_5 + D_Price_6 + D_SP500_1 + D_SP500_2 + D_SP500_3 + D_SP500_4 + D_SP500_5 + D_SP500_6, data=subset(train,t>7))
+summary(LMUD)
+LMtil <- lm(D_Price ~ D_Price_1 + D_Price_2 + D_Price_3 + D_Price_4 + D_Price_5 + D_Price_6+ D_SP500_1, data=subset(train,t>7))
+anova(LMtil,LMUD)
+# One is enough
+```
+
+#### Does Supply granger cause the price when conditioning on SP500?
+
+```{r}
+LMUD <- lm(D_Price ~ D_Price_1 + D_Price_2 + D_Price_3 + D_Price_4 + D_Price_5 + D_Price_6 + D_SP500_1 + D_Supply_1 + D_Supply_2 + D_Supply_3 + D_Supply_4 + D_Supply_5 + D_Supply_6 + IIK + AFC + NE + GFC, data=subset(train,t>7))
+summary(LMUD)
+LMtil <- lm(D_Price ~ D_Price_1 + D_Price_2 + D_Price_3 + D_Price_4 + D_Price_5 + D_Price_6 + D_SP500_1 + IIK + AFC + NE + GFC, data=subset(train,t>7))
+anova(LMtil,LMUD)
+```
+No.
+
+
+#### Does KI granger cause the price when conditioning on SP500?
+
+```{r}
+LMUD <- lm(D_Price ~ D_Price_1 + D_Price_2 + D_Price_3 + D_Price_4 + D_Price_5 + D_Price_6 + D_SP500_1 + D_KI_1 + D_KI_2 + D_KI_3 + D_KI_4 + D_KI_5 + D_KI_6 + IIK + AFC + NE + GFC, data=subset(train,t>7))
+summary(LMUD)
+LMtil <- lm(D_Price ~ D_Price_1 + D_Price_2 + D_Price_3 + D_Price_4 + D_Price_5 + D_Price_6 + D_SP500_1+ IIK + AFC + NE + GFC, data=subset(train,t>7))
+anova(LMtil,LMUD)
+```
+No.
+
+
+
+### (iii) Testing for the explanatory variables when using 1 lag.
+
+#### Does supply granger cause price?
+
+```{r}
+LMUD <- lm(D_Price ~ D_Price_1 + D_Supply_1, data=train)
+summary(LMUD)
+```
+
+Dosent seem like it.
+
+#### Does KI granger cause price?
+
+```{r}
+LMUD <- lm(D_Price ~ D_Price_1 + D_KI_1, data=train)
+summary(LMUD)
+```
+Dosent seem like it - however close to being significant.
+
+#### Does SP500 granger cause price?
+
+```{r}
+LMUD <- lm(D_Price ~ D_Price_1 + D_SP500_1, data=train)
+summary(LMUD)
+```
+YES!
+
+
+#### Does Supply granger cause the price when conditioning on SP500?
+
+```{r}
+LMUD <- lm(D_Price ~ D_Price_1 +D_SP500_1 + D_Supply_1, data=train)
+summary(LMUD)
+
+```
+No.
+
+#### Does KI granger cause the price when conditioning on SP500?
+
+```{r}
+LMUD <- lm(D_Price ~ D_Price_1 +D_SP500_1 + D_KI_1, data=train)
+summary(LMUD)
+
+```
+No.
+
+
+
+
+### (iv) Testing for the explanatory variables when using 1 lag and dummies.
+
+#### Does supply granger cause price?
+
+```{r}
+LMUD <- lm(D_Price ~ D_Price_1 + D_Supply_1 + IIK + AFC + NE + GFC, data=train)
+summary(LMUD)
+```
+Dosent seem like it.
+
+#### Does KI granger cause price?
+
+```{r}
+LMUD <- lm(D_Price ~ D_Price_1 + D_KI_1+ IIK + AFC + NE + GFC, data=train)
+summary(LMUD)
+```
+Dosent seem like it - however close to being significant.
+
+#### Does SP500 granger cause price?
+
+```{r}
+LMUD <- lm(D_Price ~ D_Price_1 + D_SP500_1+ IIK + AFC + NE + GFC, data=train)
+summary(LMUD)
+```
+YES!
+
+
+#### Does Supply granger cause the price when conditioning on SP500?
+
+```{r}
+LMUD <- lm(D_Price ~ D_Price_1 +D_SP500_1 + D_Supply_1, data=train)
+summary(LMUD)
+
+```
+No.
+
+#### Does KI granger cause the price when conditioning on SP500?
+
+```{r}
+LMUD <- lm(D_Price ~ D_Price_1 +D_SP500_1 + D_KI_1+ IIK + AFC + NE + GFC, data=train)
+summary(LMUD)
+
+```
+No.
+
+
+
+
+## Defining the models
+
+### $AR(6)+X$
+
+```{r}
+AR6X <- lm(D_Price ~ D_Price_1 + D_Price_2 + D_Price_3 + D_Price_4 + D_Price_5 + D_Price_6 + D_SP500_1, data=train)
+summary(AR6X)
+
+## Making predictions
+predictions <- predict(AR6X, test)
+predictions <- predictions + test$Price_1
+
+## Error calculating
+RMSE_AR6X <- sqrt(mean((test$Price - predictions)^2))
+MAE_AR6X <- mean(abs(test$Price - predictions))
+
+```
+
+### $AR(6)+X$ and dummies
+
+```{r}
+AR6Xd <- lm(D_Price ~ D_Price_1 + D_Price_2 + D_Price_3 + D_Price_4 + D_Price_5 + D_Price_6 + D_SP500_1+ IIK + AFC + NE + GFC, data=train)
+summary(AR6Xd)
+
+## Making predictions
+predictions <- predict(AR6Xd, test)
+predictions <- predictions + test$Price_1
+
+## Error calculating
+RMSE_AR6Xd <- sqrt(mean((test$Price - predictions)^2))
+MAE_AR6Xd <- mean(abs(test$Price - predictions))
+
+```
+
+
+
+### $AR(1)+X$
+
+```{r}
+AR1X <- lm(D_Price ~ D_Price_1 + D_SP500_1, data=train)
+summary(AR1X)
+
+## Making predictions
+predictions <- predict(AR1X, test)
+predictions <- predictions + test$Price_1
+
+## Error calculating
+RMSE_AR1X <- sqrt(mean((test$Price - predictions)^2))
+MAE_AR1X <- mean(abs(test$Price - predictions))
+```
+
+
+### $AR(1)+X$ and dummies
+
+```{r}
+AR1Xd <- lm(D_Price ~ D_Price_1 + D_SP500_1+ IIK + AFC + NE + GFC, data=train)
+summary(AR1Xd)
+
+## Making predictions
+predictions <- predict(AR1Xd, test)
+predictions <- predictions + test$Price_1
+
+## Error calculating
+RMSE_AR1Xd <- sqrt(mean((test$Price - predictions)^2))
+MAE_AR1Xd <- mean(abs(test$Price - predictions))
+
+```
+
+
+
+### $AR(6)$
+
+```{r}
+AR6 <- lm(D_Price ~ D_Price_1 + D_Price_2 + D_Price_3 + D_Price_4 + D_Price_5 + D_Price_6, data=train)
+summary(AR6)
+
+## Making predictions
+predictions <- predict(AR6, test)
+predictions <- predictions + test$Price_1
+
+## Error calculating
+RMSE_AR6 <- sqrt(mean((test$Price - predictions)^2))
+MAE_AR6 <- mean(abs(test$Price - predictions))
+
+```
+
+### $AR(1)$
+
+```{r}
+AR1 <- lm(D_Price ~ D_Price_1, data=train)
+summary(AR1)
+
+## Making predictions
+predictions <- predict(AR1, test)
+predictions <- predictions + test$Price_1
+
+## Error calculating
+RMSE_AR1 <- sqrt(mean((test$Price - predictions)^2))
+MAE_AR1 <- mean(abs(test$Price - predictions))
+
+```
+
+### Random Walk
+
+```{r}
+## Making predictions
+predictions <- test$Price_1
+
+## Error calculating
+RMSE_RW <- sqrt(mean((test$Price - predictions)^2))
+MAE_RW <- mean(abs(test$Price - predictions))
+```
+
+#### Creating a table summarizing errors
+
+```{r}
+RMSE <- cbind(RMSE_AR6X,RMSE_AR1X,RMSE_AR6Xd,RMSE_AR1Xd,RMSE_AR6,RMSE_AR1,RMSE_RW)
+MAE <- cbind(MAE_AR6X,MAE_AR1X,MAE_AR6Xd,MAE_AR1Xd,MAE_AR6,MAE_AR1,MAE_RW)
+Table <- rbind(RMSE,MAE)
+colnames(Table) <- c("AR6X", "AR1X", "AR6Xd", "AR1Xd", "AR(6)", "AR(1)", "Random Walk")
+rownames(Table) <- c("RMSE", "MAE")
+Table %>%
+  kable(digits = 3, "latex", booktabs = T)%>%
+  kable_styling(latex_options="scale_down")%>%
+  add_header_above(c("Forecassting performance"=8))
+```
+
+### Tryng the same models, but leaving out the data for $2020$ (pandemic)
+
+```{r}
+testCORONA <- subset(data, Date >= as.Date("2014-01-01") & Date < as.Date("2020-01-01"))
+```
+
+### $AR(6)+X$ CORONA
+
+```{r}
+AR6X <- lm(D_Price ~ D_Price_1 + D_Price_2 + D_Price_3 + D_Price_4 + D_Price_5 + D_Price_6 + D_SP500_1, data=train)
+#summary(AR6X)
+
+## Making predictions
+predictions <- predict(AR6X, testCORONA)
+predictions <- predictions + testCORONA$Price_1
+
+## Error calculating
+RMSE_AR6X <- sqrt(mean((testCORONA$Price - predictions)^2))
+MAE_AR6X <- mean(abs(testCORONA$Price - predictions))
+
+```
+
+### $AR(1)+X$ CORONA
+
+```{r}
+AR1X <- lm(D_Price ~ D_Price_1 + D_SP500_1, data=train)
+#summary(AR1X)
+
+## Making predictions
+predictions <- predict(AR1X, testCORONA)
+predictions <- predictions + testCORONA$Price_1
+
+## Error calculating
+RMSE_AR1X <- sqrt(mean((testCORONA$Price - predictions)^2))
+MAE_AR1X <- mean(abs(testCORONA$Price - predictions))
+
+```
+
+
+### $AR(6)+X$ and dummies CORONA
+
+```{r}
+AR6Xd <- lm(D_Price ~ D_Price_1 + D_Price_2 + D_Price_3 + D_Price_4 + D_Price_5 + D_Price_6 + D_SP500_1+ IIK + AFC + NE + GFC, data=train)
+summary(AR6Xd)
+
+## Making predictions
+predictions <- predict(AR6Xd, testCORONA)
+predictions <- predictions + testCORONA$Price_1
+
+## Error calculating
+RMSE_AR6Xd <- sqrt(mean((testCORONA$Price - predictions)^2))
+MAE_AR6Xd <- mean(abs(testCORONA$Price - predictions))
+
+```
+
+### $AR(1)+X$ and dummies CORONA
+
+```{r}
+AR1Xd <- lm(D_Price ~ D_Price_1 + D_SP500_1+ IIK + AFC + NE + GFC, data=train)
+summary(AR1Xd)
+
+## Making predictions
+predictions <- predict(AR1Xd, testCORONA)
+predictions <- predictions + testCORONA$Price_1
+
+## Error calculating
+RMSE_AR1Xd <- sqrt(mean((testCORONA$Price - predictions)^2))
+MAE_AR1Xd <- mean(abs(testCORONA$Price - predictions))
+
+```
+
+
+### $AR(6)$ CORONA
+
+```{r}
+AR6 <- lm(D_Price ~ D_Price_1 + D_Price_2 + D_Price_3 + D_Price_4 + D_Price_5 + D_Price_6, data=train)
+#summary(AR6)
+
+## Making predictions
+predictions <- predict(AR6, testCORONA)
+predictions <- predictions + testCORONA$Price_1
+
+## Error calculating
+RMSE_AR6 <- sqrt(mean((testCORONA$Price - predictions)^2))
+MAE_AR6 <- mean(abs(testCORONA$Price - predictions))
+
+```
+
+### $AR(1)$ CORONA
+
+```{r}
+AR1 <- lm(D_Price ~ D_Price_1, data=train)
+#summary(AR1)
+
+## Making predictions
+predictions <- predict(AR1, testCORONA)
+predictions <- predictions + testCORONA$Price_1
+
+## Error calculating
+RMSE_AR1 <- sqrt(mean((testCORONA$Price - predictions)^2))
+MAE_AR1 <- mean(abs(testCORONA$Price - predictions))
+
+```
+
+### Random Walk CORONA
+
+```{r}
+## Making predictions
+predictions <- testCORONA$Price_1
+
+## Error calculating
+RMSE_RW <- sqrt(mean((testCORONA$Price - predictions)^2))
+MAE_RW <- mean(abs(testCORONA$Price - predictions))
+```
+
+#### Creating a table summarizing errors
+
+```{r}
+RMSE <- cbind(RMSE_AR6X,RMSE_AR1X,RMSE_AR6Xd,RMSE_AR1Xd,RMSE_AR6,RMSE_AR1,RMSE_RW)
+MAE <- cbind(MAE_AR6X,MAE_AR1X,MAE_AR6Xd,MAE_AR1Xd,MAE_AR6,MAE_AR1,MAE_RW)
+Table <- rbind(RMSE,MAE)
+colnames(Table) <- c("AR6X", "AR1X", "AR6Xd", "AR1Xd", "AR(6)", "AR(1)", "Random Walk")
+rownames(Table) <- c("RMSE", "MAE")
+Table %>%
+  kable(digits = 3, "latex", booktabs = T)%>%
+  kable_styling(latex_options="scale_down")%>%
+  add_header_above(c("Forecassting performance leaving out 2020"=8))
+```
+
+## Testing for serial correlation and heteroskedasticity
+
+### AR6X
+
+```{r}
+AR6X <- lm(D_Price ~ D_Price_1 + D_Price_2 + D_Price_3 + D_Price_4 + D_Price_5 + D_Price_6 + D_SP500_1, data=train)
+u <- AR6X$residuals
+u <- c(NA,NA,NA,NA,NA,NA,NA,u)
+u_1 <- c(NA,u[-length(u)])
+res <- summary(lm(u~u_1 + D_Price_1 + D_Price_2 + D_Price_3 + D_Price_4 + D_Price_5 + D_Price_6 + D_SP500_1, data=train))
+BG_pval_AR6X <- res$coefficients[2,4]
+DW_pval_AR6X <- dwtest(AR6X)$p.val
+u2 <- u^2
+BP <- summary(lm(u2~ D_Price_1 + D_Price_2 + D_Price_3 + D_Price_4 + D_Price_5 + D_Price_6 + D_SP500_1, data=train))
+BP_pval_AR6X <- 0.0026
+```
+
+
+
+### AR1X
+
+```{r}
+AR1X <- lm(D_Price ~ D_Price_1 + D_SP500_1, data=train)
+u <- AR1X$residuals
+u <- c(NA,NA,u)
+u_1 <- c(NA,u[-length(u)])
+res <- summary(lm(u~u_1 + D_Price_1 + D_SP500_1, data=train))
+BG_pval_AR1X <- res$coefficients[2,4]
+DW_pval_AR1X <- dwtest(AR1X)$p.val
+u2 <- u^2
+BP <- summary(lm(u2~ D_Price_1 + D_SP500_1, data=train))
+BP_pval_AR1X <- 0.005
+```
+
+
+### AR6Xd
+
+```{r}
+AR6Xd <- lm(D_Price ~ D_Price_1 + D_Price_2 + D_Price_3 + D_Price_4 + D_Price_5 + D_Price_6 + D_SP500_1+ IIK + AFC + NE + GFC, data=train)
+u <- AR6Xd$residuals
+u <- c(NA,NA,NA,NA,NA,NA,NA,u)
+u_1 <- c(NA,u[-length(u)])
+res <- summary(lm(u~u_1 + D_Price_1 + D_Price_2 + D_Price_3 + D_Price_4 + D_Price_5 + D_Price_6 + D_SP500_1+ IIK + AFC + NE + GFC, data=train))
+BG_pval_AR6Xd <- res$coefficients[2,4]
+DW_pval_AR6Xd <- dwtest(AR6Xd)$p.val
+u2 <- u^2
+BP <- summary(lm(u2~ D_Price_1 + D_Price_2 + D_Price_3 + D_Price_4 + D_Price_5 + D_Price_6 + D_SP500_1+ IIK + AFC + NE + GFC, data=train))
+BP_pval_AR6Xd <- 0.0001
+```
+### AR1Xd
+
+```{r}
+AR1Xd <- lm(D_Price ~ D_Price_1 + D_SP500_1+ IIK + AFC + NE + GFC, data=train)
+u <- AR1Xd$residuals
+u <- c(NA,NA,u)
+u_1 <- c(NA,u[-length(u)])
+res <- summary(lm(u~u_1 + D_Price_1 + D_SP500_1+ IIK + AFC + NE + GFC, data=train))
+BG_pval_AR1Xd <- res$coefficients[2,4]
+DW_pval_AR1Xd <- dwtest(AR1Xd)$p.val
+u2 <- u^2
+BP <- summary(lm(u2~ D_Price_1 + D_SP500_1+ IIK + AFC + NE + GFC, data=train))
+BP_pval_AR1Xd <- 0.0001
+```
+### AR6
+
+```{r}
+AR6 <- lm(D_Price ~ D_Price_1 + D_Price_2 + D_Price_3 + D_Price_4 + D_Price_5 + D_Price_6, data=train)
+u <- AR6$residuals
+u <- c(NA,NA,NA,NA,NA,NA,NA,u)
+u_1 <- c(NA,u[-length(u)])
+res <- summary(lm(u~u_1 + D_Price_1 + D_Price_2 + D_Price_3 + D_Price_4 + D_Price_5 + D_Price_6, data=train))
+BG_pval_AR6 <- res$coefficients[2,4]
+DW_pval_AR6 <- dwtest(AR6)$p.val
+u2 <- u^2
+BP <- summary(lm(u2~ D_Price_1 + D_Price_2 + D_Price_3 + D_Price_4 + D_Price_5 + D_Price_6, data=train))
+BP_pval_AR6 <- 0.0002
+```
+### AR1
+
+```{r}
+AR1 <- lm(D_Price ~ D_Price_1, data=train)
+u <- AR1$residuals
+u <- c(NA,NA,u)
+u_1 <- c(NA,u[-length(u)])
+res <- summary(lm(u~u_1 + D_Price_1, data=train))
+BG_pval_AR1 <- res$coefficients[2,4]
+DW_pval_AR1 <- dwtest(AR1)$p.val
+u2 <- u^2
+BP <- summary(lm(u2~ D_Price_1, data=train))
+BP_pval_AR1 <- 0.0004
+```
+
+
+#### Table summarizing results from tests
+```{r}
+BG <- cbind(BG_pval_AR6X,BG_pval_AR1X,BG_pval_AR6Xd,BG_pval_AR1Xd,BG_pval_AR6,BG_pval_AR1)
+DW <- cbind(DW_pval_AR6X,DW_pval_AR1X,DW_pval_AR6Xd,DW_pval_AR1Xd,DW_pval_AR6,DW_pval_AR1)
+BP <- cbind(BP_pval_AR6X,BP_pval_AR1X,BP_pval_AR6Xd,BP_pval_AR1Xd,BP_pval_AR6,BP_pval_AR1)
+Table <- rbind(BG,DW,BP)
+colnames(Table) <- c("AR6X", "AR1X", "AR6Xd", "AR1Xd", "AR(6)", "AR(1)")
+rownames(Table) <- c("BG", "DW", "BP")
+Table %>%
+  kable(digits = 3, "latex", booktabs = T)%>%
+  kable_styling()%>%
+  add_header_above(c("Tests for serial sorrelation and heteroskedasticity (p-vals)"=7))
+```
+
+## Things in the discussion
+
+```{r}
+plot(ts(test$Price,start = c(2014,1), frequency = 12), ylab="WTI Crude Oil Price", main = "Monthly WTI crude oil spot price")
+plot(ts(test$SP500,start = c(2014,1), frequency = 12), ylab="WTI Crude Oil Price", main = "Monthly WTI crude oil spot price")
+```
+
+### Seasonality and trend
+
+```{r}
+# First adding a linear trend
+AR6Xd <- lm(D_Price ~ D_Price_1 + D_Price_2 + D_Price_3 + D_Price_4 + D_Price_5 + D_Price_6 + D_SP500_1+ IIK + AFC + NE + GFC + t, data=train)
+AR1Xd <- lm(D_Price ~ D_Price_1 + D_SP500_1+ IIK + AFC + NE + GFC +t, data=train)
+AR6X <- lm(D_Price ~ D_Price_1 + D_Price_2 + D_Price_3 + D_Price_4 + D_Price_5 + D_Price_6 + D_SP500_1+t, data=train)
+AR1X <- lm(D_Price ~ D_Price_1 + D_SP500_1+t, data=train)
+coeftest(AR6Xd, vcov=vcovHAC(AR6Xd))
+coeftest(AR1Xd, vcov=vcovHAC(AR1Xd))
+coeftest(AR6X, vcov=vcovHAC(AR6X))
+coeftest(AR1X, vcov=vcovHAC(AR1X))
+# None are significant at a 0.01 significance level
+
+# Seasonality
+AR6Xd <- lm(D_Price ~ D_Price_1 + D_Price_2 + D_Price_3 + D_Price_4 + D_Price_5 + D_Price_6 + D_SP500_1+ IIK + AFC + NE + GFC, data=train)
+AR6Xd_s <- lm(D_Price ~ D_Price_1 + D_Price_2 + D_Price_3 + D_Price_4 + D_Price_5 + D_Price_6 + D_SP500_1+ IIK + AFC + NE + GFC + feb+mar+apr+may+jun+jul+aug+sep+oct+nov+dec, data=train)
+waldtest(AR6Xd,AR6Xd_s,vcov = vcovHAC(AR6Xd_s))
+#NOT SIGNIFICANT
+AR1Xd <- lm(D_Price ~ D_Price_1 + D_SP500_1+ IIK + AFC + NE + GFC, data=train)
+AR1Xd_s <- lm(D_Price ~ D_Price_1 + D_SP500_1+ IIK + AFC + NE + GFC +feb+mar+apr+may+jun+jul+aug+sep+oct+nov+dec, data=train)
+waldtest(AR1Xd,AR1Xd_s,vcov = vcovHAC(AR1Xd_s))
+#NOT SIGNIFICANT
+AR6X <- lm(D_Price ~ D_Price_1 + D_Price_2 + D_Price_3 + D_Price_4 + D_Price_5 + D_Price_6 + D_SP500_1, data=train)
+AR6X_s <- lm(D_Price ~ D_Price_1 + D_Price_2 + D_Price_3 + D_Price_4 + D_Price_5 + D_Price_6 + D_SP500_1+feb+mar+apr+may+jun+jul+aug+sep+oct+nov+dec, data=train)
+waldtest(AR6X,AR6X_s,vcov = vcovHAC(AR6X_s))
+#NOT SIGNIFICANT
+AR1X <- lm(D_Price ~ D_Price_1 + D_SP500_1, data=train)
+AR1X_s <- lm(D_Price ~ D_Price_1 + D_SP500_1+feb+mar+apr+may+jun+jul+aug+sep+oct+nov+dec, data=train)
+waldtest(AR1X,AR1X_s,vcov = vcovHAC(AR1X_s))
+#Not significant
+```
+
+
+
